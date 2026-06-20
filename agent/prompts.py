@@ -27,6 +27,46 @@ TASK_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
 GENERAL = "general"
 
 
+# --------------------------------------------------------------------------- #
+# Per-category server-tool routing (BUILD phase).
+#
+# Anthropic server tools (run server-side; results return as *_tool_result blocks
+# inside resp.content). HARD RULE: never co-declare code_execution with the dated
+# web tools in one request (documented misconfig — "a second execution environment
+# confuses the model"). One toolset per request.
+#
+# Tool identifiers verified against the claude-api skill (Server Tools QR + the
+# Python tool-use doc): code_execution_20260120 (Opus 4.5+, NON-beta path; result
+# block bash_code_execution_tool_result) and web_search_20260209 / web_fetch_20260209
+# (dynamic-filtering variants, Opus 4.8).
+# --------------------------------------------------------------------------- #
+CODE_TOOLS: list[dict] = [
+    {"type": "code_execution_20260120", "name": "code_execution"},
+]
+WEB_TOOLS: list[dict] = [
+    {"type": "web_search_20260209", "name": "web_search"},
+    {"type": "web_fetch_20260209", "name": "web_fetch"},
+]
+
+TOOLSET_BY_CATEGORY: dict[str, list[dict]] = {
+    "code_synthesis": CODE_TOOLS,    # write + run + verify code
+    "logic_reason": CODE_TOOLS,      # compute / check via code
+    "data_extraction": CODE_TOOLS,   # parse / transform via code
+    "context_awareness": WEB_TOOLS,  # grounding
+    "grounded": WEB_TOOLS,           # explicit grounded-search route
+    GENERAL: [],                     # no tools — direct answer
+}
+
+
+def toolset_for_category(category: str) -> list[dict]:
+    """Map an arena category to the Anthropic server-tool spec list for the request.
+
+    Kept here (no agent dependency) so routing is unit-testable in one place and
+    agent.py can import the map without a circular import.
+    """
+    return TOOLSET_BY_CATEGORY.get(category, [])
+
+
 def detect_task_type(title: str, description: str) -> str:
     """Best-effort keyword classification into an arena category.
 

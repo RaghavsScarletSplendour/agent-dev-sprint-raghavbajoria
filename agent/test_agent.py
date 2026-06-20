@@ -68,6 +68,28 @@ class FakeClient:
         self.messages = FakeMessages(scripted)
 
 
+# A kwarg-capturing variant for asserting per-category tool routing / effort / max_tokens.
+# Subclass (do NOT touch the shared FakeMessages — keep the 11 green).
+class CapturingMessages(FakeMessages):
+    def __init__(self, scripted: list[Resp]):
+        super().__init__(scripted)
+        self.calls: list[dict[str, Any]] = []  # one kwargs dict per create()
+
+    def create(self, **kw: Any) -> Resp:
+        self.calls.append(kw)
+        return super().create(**kw)
+
+
+class CapturingClient:
+    def __init__(self, scripted: list[Resp]):
+        self.messages = CapturingMessages(scripted)
+
+
+def _tool_types(kw: dict[str, Any]) -> set:
+    """Server-tool type identifiers declared in a captured create() call."""
+    return {t.get("type") for t in kw["tools"]}
+
+
 # --- 1. Agent loop guard tests ----------------------------------------------
 def test_converges_to_final_answer():
     """Tool call -> result fed back -> model answers. Happy path."""
@@ -108,6 +130,118 @@ def test_repeat_action_guard():
     assert runs["n"] == A.MAX_REPEAT_ACTIONS, f"tool ran {runs['n']} times"
     assert "MAX_STEPS" in out, out
     print(f"PASS: repeat-action guard caps tool execution at {A.MAX_REPEAT_ACTIONS}")
+
+
+# --- 1b. Server-tool / pause_turn loop tests (the BUILD branches) -----------
+def test_pause_turn_continues_then_finishes():
+    """A pause_turn turn (server-tool loop paused) has NO client tool_use but is NOT
+    final: the loop must append it, re-send, and keep going until end_turn. This is the
+    regression anchor — it fails against the old 'no tool_use -> return' logic."""
+    client = FakeClient([
+        Resp([TextBlock("(searching...)")], stop_reason="pause_turn"),
+        Resp([TextBlock("FINAL ANSWER")], stop_reason="end_turn"),
+    ])
+    out = A.Agent(client=client).run("grounded q")
+    assert out == "FINAL ANSWER", out
+    assert client.messages.i == 2, client.messages.i  # made the 2nd create(), didn't return early
+    print("PASS: pause_turn continues, then returns the final answer")
+
+
+def test_pause_turn_does_not_return_partial():
+    """The intermediate pause_turn text must never leak as the answer."""
+    client = FakeClient([
+        Resp([TextBlock("(searching...)")], stop_reason="pause_turn"),
+        Resp([TextBlock("FINAL ANSWER")], stop_reason="end_turn"),
+    ])
+    out = A.Agent(client=client).run("grounded q")
+    assert out != "(searching...)", out
+    print("PASS: pause_turn never leaks the intermediate text")
+
+
+@dataclass
+class CodeResultBlock:
+    """Stand-in for a server-side bash_code_execution_tool_result block."""
+    type: str = "bash_code_execution_tool_result"
+    content: Any = None
+
+
+def test_server_tool_result_turn_returns_text():
+    """An end_turn whose content interleaves a server-tool result block + text has NO
+    client tool_use — the loop must return the (last) text without expecting a
+    client-side tool_result."""
+    client = FakeClient([
+        Resp([CodeResultBlock(), TextBlock("computed answer")], stop_reason="end_turn"),
+    ])
+    out = A.Agent(client=client).run("compute something")
+    assert out == "computed answer", out
+    assert client.messages.i == 1, client.messages.i
+    print("PASS: server-tool result turn returns text, no client tool_result needed")
+
+
+def test_code_category_declares_code_execution_alone():
+    """code_synthesis routing declares code_execution and NEVER the dated web tools
+    (documented misconfig: never co-declare them)."""
+    from agent.prompts import toolset_for_category
+    for category in ("code_synthesis", "logic_reason", "data_extraction"):
+        client = CapturingClient([Resp([TextBlock("ok")], stop_reason="end_turn")])
+        A.Agent(client=client).run("x", server_tools=toolset_for_category(category))
+        types = _tool_types(client.messages.calls[0])
+        assert types == {"code_execution_20260120"}, (category, types)
+        assert "web_search_20260209" not in types and "web_fetch_20260209" not in types
+    print("PASS: code/logic/data declare code_execution ALONE (no web tools)")
+
+
+def test_context_category_declares_web_tools_alone():
+    """context/grounded routing declares the web tools and NEVER code_execution."""
+    from agent.prompts import toolset_for_category
+    for category in ("context_awareness", "grounded"):
+        client = CapturingClient([Resp([TextBlock("ok")], stop_reason="end_turn")])
+        A.Agent(client=client).run("x", server_tools=toolset_for_category(category))
+        types = _tool_types(client.messages.calls[0])
+        assert types == {"web_search_20260209", "web_fetch_20260209"}, (category, types)
+        assert "code_execution_20260120" not in types
+    print("PASS: context/grounded declare web tools ALONE (no code_execution)")
+
+
+def test_general_category_declares_no_server_tools():
+    """general -> no server tools; baseline direct-answer path preserved."""
+    from agent.prompts import toolset_for_category
+    client = CapturingClient([Resp([TextBlock("ok")], stop_reason="end_turn")])
+    A.Agent(client=client).run("x", server_tools=toolset_for_category("general"))
+    assert client.messages.calls[0]["tools"] == [], client.messages.calls[0]["tools"]
+    print("PASS: general declares no server tools")
+
+
+def test_tool_using_turn_raises_max_tokens():
+    """Tool-using turns raise max_tokens off the no-tool default; general stays at it."""
+    from agent.prompts import toolset_for_category
+    code = CapturingClient([Resp([TextBlock("ok")], stop_reason="end_turn")])
+    A.Agent(client=code).run("x", server_tools=toolset_for_category("code_synthesis"))
+    assert code.messages.calls[0]["max_tokens"] == A.MAX_TOKENS_TOOLS
+
+    plain = CapturingClient([Resp([TextBlock("ok")], stop_reason="end_turn")])
+    A.Agent(client=plain).run("x", server_tools=toolset_for_category("general"))
+    assert plain.messages.calls[0]["max_tokens"] == A.MAX_TOKENS_DEFAULT
+    print(f"PASS: tool turns use max_tokens={A.MAX_TOKENS_TOOLS}, no-tool stays "
+          f"{A.MAX_TOKENS_DEFAULT}")
+
+
+def test_effort_threaded_into_create():
+    """The effort arg reaches output_config.effort on the create() call."""
+    client = CapturingClient([Resp([TextBlock("ok")], stop_reason="end_turn")])
+    A.Agent(client=client).run("x", effort="xhigh", server_tools=[])
+    assert client.messages.calls[0]["output_config"] == {"effort": "xhigh"}
+    print("PASS: effort is threaded into output_config")
+
+
+def test_effort_for_routing():
+    """effort_for: xhigh for code/logic and high levels; high otherwise."""
+    assert O.effort_for({"level": 1}, "code_synthesis") == "xhigh"
+    assert O.effort_for({"level": 1}, "logic_reason") == "xhigh"
+    assert O.effort_for({"level": 6}, "general") == "xhigh"      # high level
+    assert O.effort_for({"level": 2}, "general") == "high"
+    assert O.effort_for({"level": 2}, "context_awareness") == "high"
+    print("PASS: effort_for -> xhigh for code/logic/high-level, high otherwise")
 
 
 # --- 2a. Pure parser tests (no network, no mocking) -------------------------
@@ -260,6 +394,65 @@ def test_malformed_get_tasks_breaks_clean():
     print("PASS: malformed get_tasks -> clean break, no submit")
 
 
+_SENTINEL = "ALL_TASKS_ATTEMPTED: all current-level tasks done; wait for level advancement"
+
+
+def _with_stubbed_sleep(arena: FakeArena, coro_factory):
+    """Run with O.mcp_call mocked AND O.asyncio.sleep replaced by a counting no-op,
+    so keep-alive's wait path is exercised instantly. Returns the sleep counter dict."""
+    sleeps = {"n": 0}
+    real_sleep = O.asyncio.sleep
+
+    async def _noop(*_a, **_k):
+        sleeps["n"] += 1
+
+    O.asyncio.sleep = _noop
+    O.mcp_call = arena
+    try:
+        asyncio.run(coro_factory())
+    finally:
+        O.asyncio.sleep = real_sleep
+        O.mcp_call = M.mcp_call
+    return sleeps
+
+
+def test_keepalive_retries_then_stops():
+    """Sentinel returned more times than the retry cap: poll initial + MAX_KEEPALIVE_RETRIES
+    times, sleep MAX_KEEPALIVE_RETRIES times, never submit/skip, then exit cleanly."""
+    arena = FakeArena(get_responses=[_SENTINEL] * (O.MAX_KEEPALIVE_RETRIES + 5))
+    sleeps = _with_stubbed_sleep(
+        arena, lambda: O.run(cfg=_fake_cfg(), agent=_fake_agent("ANS")))
+    assert arena.count("get_tasks") == O.MAX_KEEPALIVE_RETRIES + 1, arena.count("get_tasks")
+    assert sleeps["n"] == O.MAX_KEEPALIVE_RETRIES, sleeps["n"]
+    assert arena.count("submit_task") == 0
+    assert arena.count("skip_task") == 0
+    print("PASS: keep-alive retries the sentinel a bounded number of times, then stops")
+
+
+def test_keepalive_resumes_when_new_task_unlocks():
+    """Sentinel twice, then a real task unlocks: keep-alive waits through both sentinels,
+    resumes, and submits the new task."""
+    new_task = '{"id":"t_new","title":"x","description":"y"}'
+    arena = FakeArena(get_responses=[_SENTINEL, _SENTINEL, new_task])
+    sleeps = _with_stubbed_sleep(
+        arena, lambda: O.run(cfg=_fake_cfg(), agent=_fake_agent("ANS")))
+    assert arena.count("submit_task") == 1, arena.count("submit_task")
+    assert arena.args_for("submit_task")["taskId"] == "t_new"
+    assert sleeps["n"] == 2, sleeps["n"]  # waited through exactly the two sentinels
+    print("PASS: keep-alive resumes and submits when a new level unlocks")
+
+
+def test_no_keepalive_on_genuine_none():
+    """A non-sentinel un-parseable reply must break immediately — ZERO sleeps, ONE poll —
+    so keep-alive doesn't stall mid-run on a real end-state."""
+    arena = FakeArena(get_responses=["NO_TASKS"])
+    sleeps = _with_stubbed_sleep(
+        arena, lambda: O.run(cfg=_fake_cfg(), agent=_fake_agent("ANS")))
+    assert sleeps["n"] == 0, sleeps["n"]
+    assert arena.count("get_tasks") == 1, arena.count("get_tasks")
+    print("PASS: genuine None breaks immediately (keep-alive is sentinel-only)")
+
+
 def test_max_tasks_bound():
     """get_tasks returns a fresh distinct task forever -> loop must stop at MAX_TASKS."""
 
@@ -297,12 +490,24 @@ if __name__ == "__main__":
     test_converges_to_final_answer()
     test_max_steps_cap()
     test_repeat_action_guard()
+    test_pause_turn_continues_then_finishes()
+    test_pause_turn_does_not_return_partial()
+    test_server_tool_result_turn_returns_text()
+    test_code_category_declares_code_execution_alone()
+    test_context_category_declares_web_tools_alone()
+    test_general_category_declares_no_server_tools()
+    test_tool_using_turn_raises_max_tokens()
+    test_effort_threaded_into_create()
+    test_effort_for_routing()
     test_parsers()
     test_flow_register_get_submit()
     test_double_submit_blocked()
     test_skip_on_empty_answer()
     test_sticky_already_submitted_skip()
     test_malformed_get_tasks_breaks_clean()
+    test_keepalive_retries_then_stops()
+    test_keepalive_resumes_when_new_task_unlocks()
+    test_no_keepalive_on_genuine_none()
     test_max_tasks_bound()
     test_auth_error_clean_exit()
     print("\nAll offline tests passed — agent guards + arena flow are verified.")

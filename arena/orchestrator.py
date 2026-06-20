@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 import anthropic
 
 from agent.agent import Agent
-from agent.prompts import build_task_prompt, detect_task_type
+from agent.prompts import build_task_prompt, detect_task_type, toolset_for_category
 from arena.config import Config, assert_valid, load_config
 from arena.mcp_client import (
     ArenaAuthError,
@@ -38,6 +38,13 @@ from arena.mcp_client import (
 MAX_TASKS = 10          # hard ceiling on tasks attempted per run
 MAX_CONSEC_SKIPS = 3    # stop if we skip this many in a row (anti-starvation)
 
+# Keep-alive on ALL_TASKS_ATTEMPTED (BUILD TARGET 2). The arena returns the plain-text
+# sentinel "ALL_TASKS_ATTEMPTED: ... wait for level advancement" when the current level
+# is drained; new levels unlock over time. Instead of stopping, we sleep and re-poll a
+# BOUNDED number of times so the single live process keeps climbing as levels open.
+MAX_KEEPALIVE_RETRIES = 6
+KEEPALIVE_SLEEP_S = 15
+
 
 @dataclass
 class RunState:
@@ -48,6 +55,10 @@ class RunState:
     consecutive_skips: int = 0
     tasks_done: int = 0
     submitted_task_ids: set[str] = field(default_factory=set)
+    # True when the LAST get_tasks returned the ALL_TASKS_ATTEMPTED sentinel (level
+    # drained, wait for advancement) rather than a genuine end-state / parse failure.
+    # Drives keep-alive: only the sentinel triggers sleep+re-poll.
+    last_get_tasks_sentinel: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -104,6 +115,16 @@ async def register_once(cfg: Config, state: RunState) -> None:
     print(f"[register] agent_id={state.agent_id} level={state.level}")
 
 
+def _is_all_tasks_attempted(text: str) -> bool:
+    """True if a get_tasks response is the ALL_TASKS_ATTEMPTED level-drained sentinel.
+
+    This is a deliberate, narrow match: only this sentinel means 'wait for a new level
+    to unlock'. A genuine end-state or an unparseable reply must NOT trigger keep-alive
+    (otherwise the run stalls 90s on a real stop), so we key keep-alive to this string.
+    """
+    return "all_tasks_attempted" in (text or "").lower()
+
+
 async def fetch_task(cfg: Config, state: RunState) -> dict | None:
     text = await mcp_call(
         "get_tasks", {"idToken": cfg.arena_id_token, "agentId": state.agent_id},
@@ -111,8 +132,12 @@ async def fetch_task(cfg: Config, state: RunState) -> dict | None:
     )
     task = parse_task(text)
     if task is None:
-        print(f"[get_tasks] no parseable task. raw: {text!r}")
+        state.last_get_tasks_sentinel = _is_all_tasks_attempted(text)
+        kind = "ALL_TASKS_ATTEMPTED (level drained)" if state.last_get_tasks_sentinel \
+            else "no parseable task"
+        print(f"[get_tasks] {kind}. raw: {text!r}")
         return None
+    state.last_get_tasks_sentinel = False
     _associate(state, task_id=str(task.get("id", "")))
     category = detect_task_type(str(task.get("title", "")), str(task.get("description", "")))
     print(f"[get_tasks] task={task.get('id')} L{task.get('level')} "
@@ -120,9 +145,41 @@ async def fetch_task(cfg: Config, state: RunState) -> dict | None:
     return task
 
 
+async def fetch_task_keepalive(cfg: Config, state: RunState) -> dict | None:
+    """fetch_task, but on the ALL_TASKS_ATTEMPTED sentinel: sleep and re-poll a bounded
+    number of times before giving up — so the single live process keeps climbing as new
+    levels unlock. A genuine None (real end-state / parse failure) returns immediately."""
+    for attempt in range(MAX_KEEPALIVE_RETRIES + 1):
+        task = await fetch_task(cfg, state)
+        if task is not None:
+            return task
+        if not state.last_get_tasks_sentinel:
+            return None  # genuine end-state — don't wait
+        if attempt < MAX_KEEPALIVE_RETRIES:
+            print(f"[keepalive] level drained (attempt {attempt + 1}/{MAX_KEEPALIVE_RETRIES}); "
+                  f"sleeping {KEEPALIVE_SLEEP_S}s for level unlock")
+            await asyncio.sleep(KEEPALIVE_SLEEP_S)
+    return None
+
+
+def effort_for(task: dict, category: str) -> str:
+    """Effort floor per task (BUILD TARGET 3). xhigh for code/logic and high arena
+    levels (best for coding/agentic per the claude-api skill); high otherwise."""
+    level = int(task.get("level", 1) or 1)
+    if category in ("code_synthesis", "logic_reason") or level >= 5:
+        return "xhigh"
+    return "high"
+
+
 async def solve(task: dict, agent: Agent) -> tuple[str, object | None]:
+    # Route per category: pick the server-tool set and effort, then hand them to the
+    # agent. code/logic/data -> code_execution ALONE; context/grounded -> web tools ALONE
+    # (never mixed — enforced by toolset_for_category's one-set-per-category map).
+    category = detect_task_type(str(task.get("title", "")), str(task.get("description", "")))
+    server_tools = toolset_for_category(category)
+    effort = effort_for(task, category)
     # Inner Claude loop is synchronous; fine for this sequential orchestrator.
-    answer = agent.run(build_task_prompt(task))
+    answer = agent.run(build_task_prompt(task), effort=effort, server_tools=server_tools)
     return answer, agent.last_usage
 
 
@@ -204,9 +261,9 @@ async def run(cfg: Config | None = None, agent: Agent | None = None) -> None:
     try:
         await register_once(cfg, state)
         while state.tasks_done < MAX_TASKS and state.consecutive_skips < MAX_CONSEC_SKIPS:
-            task = await fetch_task(cfg, state)
+            task = await fetch_task_keepalive(cfg, state)
             if task is None:
-                print("[run] no task available — stopping.")
+                print("[run] no task available (after keep-alive) — stopping.")
                 break
             # Sticky get_tasks can return a task we already submitted -> skip it.
             if str(task["id"]) in state.submitted_task_ids:

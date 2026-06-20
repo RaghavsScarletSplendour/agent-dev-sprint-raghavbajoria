@@ -28,6 +28,17 @@ MODEL = "claude-opus-4-8"
 MAX_STEPS = 12            # hard ceiling on the agentic loop — the #1 loop guard
 MAX_REPEAT_ACTIONS = 2    # same (tool, args) this many times in a row -> stop
 
+# max_tokens per turn. Tool-using turns (server-side code execution / web grounding)
+# need headroom for tool output + reasoning; no-tool turns stay tight to keep the
+# arena fast/cheap. 8192 stays well under the SDK non-streaming HTTP timeout.
+MAX_TOKENS_DEFAULT = 4096
+MAX_TOKENS_TOOLS = 8192
+
+# Default effort floor (BUILD TARGET 3). Raised off the old hardcoded "medium".
+# output_config.effort ∈ low|medium|high|xhigh|max. The orchestrator bumps this
+# per task/level (xhigh for code/logic and high arena levels).
+DEFAULT_EFFORT = "high"
+
 
 # --------------------------------------------------------------------------- #
 # Tool registry — decorate a function to expose it to the agent.
@@ -102,7 +113,24 @@ class Agent:
     system: str = SYSTEM_PROMPT
     last_usage: Any = None  # resp.usage from the most recent call (for the build-phase ledger)
 
-    def run(self, task: str) -> str:
+    def run(self, task: str, *, effort: str = DEFAULT_EFFORT,
+            server_tools: list[dict] | None = None) -> str:
+        """Solve one task.
+
+        effort        — output_config.effort floor (orchestrator-tunable per task/level).
+        server_tools  — the per-category Anthropic server-tool specs the orchestrator
+                        selected (code_execution ALONE, or web_search+web_fetch ALONE —
+                        never mixed). None -> the client-tool registry (empty baseline),
+                        which keeps the no-tool direct-answer path intact.
+
+        Finality is stop_reason-driven, not "no client tool_use": server-tool turns and
+        pause_turn turns have no client tool_use block but are NOT final. We append the
+        assistant turn unconditionally, re-send on pause_turn to resume the server-side
+        loop, and only return the final text on a normal stop.
+        """
+        active_tools = tools.specs() if server_tools is None else server_tools
+        max_tokens = MAX_TOKENS_TOOLS if active_tools else MAX_TOKENS_DEFAULT
+
         messages: list[dict[str, Any]] = [{"role": "user", "content": task}]
         last_action: tuple[str, str] | None = None
         repeat_count = 0
@@ -110,26 +138,40 @@ class Agent:
         for step in range(1, MAX_STEPS + 1):
             resp = self.client.messages.create(
                 model=MODEL,
-                max_tokens=4096,
+                max_tokens=max_tokens,
                 system=self.system,
                 thinking={"type": "adaptive"},
-                output_config={"effort": "medium"},  # fast, cheap arena turns
-                tools=tools.specs(),
+                output_config={"effort": effort},
+                tools=active_tools,
                 messages=messages,
             )
             self.last_usage = getattr(resp, "usage", None)
 
             if resp.stop_reason == "refusal":
                 return "[agent refused]"
-            # TODO(build): handle stop_reason == "pause_turn" (re-send to resume) once
-            # server-side tools (code_execution / web_search) are added. With no tools
-            # registered in the setup baseline, pause_turn cannot occur.
 
+            # ALWAYS append the assistant turn before deciding anything — the appended
+            # turn carries any server_tool_use / *_tool_result blocks back on resume.
             messages.append({"role": "assistant", "content": resp.content})
 
+            # Server-side tool loop hit its per-turn cap: re-send messages as-is (no new
+            # user message) so the server resumes. MAX_STEPS still bounds the resumes.
+            if resp.stop_reason == "pause_turn":
+                continue
+
+            # Only CLIENT-executed registry tools need a tool_result from us. Server-tool
+            # result blocks are already resolved server-side and sit in resp.content.
             tool_uses = [b for b in resp.content if b.type == "tool_use"]
-            if not tool_uses:  # no tools requested -> final answer
-                return next((b.text for b in resp.content if b.type == "text"), "")
+            if not tool_uses:
+                # end_turn (or any non-pause, non-client-tool stop) -> final answer.
+                # Take the LAST text block: server-tool turns interleave text + result
+                # blocks, and the text after the last tool result is the graded answer.
+                texts = [b.text for b in resp.content if b.type == "text"]
+                if texts:
+                    return texts[-1]
+                # Pure tool turn with no text and not a pause — keep looping rather than
+                # returning "" (safe default per the spec).
+                continue
 
             results = []
             for tu in tool_uses:
