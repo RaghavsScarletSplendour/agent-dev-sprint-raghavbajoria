@@ -7,6 +7,8 @@ This is my working folder for **Agent Dev-Sprint: Build, Deploy, and Battle** �
 I'll be **dropping notes as the day goes** — captured live, often rough. Treat them as the running source of truth for what's happening and what I need next.
 
 > 📌 **Full event details are in [`EVENT.md`](EVENT.md)** — the canonical, chat-reset-proof reference (logistics, entry rules, the "Laps" flow, arena format, the goal). Read it first if you're missing context. The summary below is just a quick glance.
+>
+> 🏆 **The arena win plan is [`arena/MASTER-PLAN.md`](arena/MASTER-PLAN.md)** — the single source of truth for the agent we're building (what the arena actually is, the win thesis, architecture, build order, and the on-site probe). Backed by `arena/MCP-DOCS.md` + `arena/TUTORIAL.md` (the captured arena interface). Read this before building or changing agent code.
 
 ## The event at a glance
 

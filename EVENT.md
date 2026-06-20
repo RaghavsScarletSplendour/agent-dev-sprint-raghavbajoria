@@ -56,6 +56,7 @@ the agent's decision-making.
 
 ## Raghav's goal
 
-Win the event (top the Agent Arena leaderboard). Pre-event prep (built + tested
-+ committed) lives in this repo — see `arena/STRATEGY.md` for the win plan and
-`agent/` for the tested agent core.
+Win the event (top the Agent Arena leaderboard). Pre-event prep lives in this
+repo — see `arena/MASTER-PLAN.md` for the win plan (the canonical strategy +
+build order), `arena/MCP-DOCS.md` / `arena/TUTORIAL.md` for the arena interface,
+and `agent/` for the tested agent core.

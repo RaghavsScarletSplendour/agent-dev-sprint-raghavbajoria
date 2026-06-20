@@ -8,9 +8,13 @@ venv/
 
 # Secrets — never commit the model key
 .env.*
+!.env.example
 *.key
 
 # OS / editor
 .DS_Store
 .idea/
 .vscode/
+
+# Claude Code session / workflow artifacts
+.claude/
