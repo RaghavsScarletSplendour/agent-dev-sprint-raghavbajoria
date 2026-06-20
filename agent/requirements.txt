@@ -1,3 +1,17 @@
-anthropic>=0.40
-fastapi>=0.110
-uvicorn>=0.29
+# Model: Anthropic Claude (claude-opus-4-8) via the official SDK.
+# 0.69 floor guarantees adaptive thinking + output_config.effort + output_config.format(json_schema).
+anthropic>=0.69
+
+# Arena MCP transport (StreamableHttpTransport, fresh-connection-per-call).
+fastmcp>=2.0
+httpx>=0.27
+
+# Config from .env
+python-dotenv>=1.0
+
+# Tracing surface the arena uses to credit tool use (Traceloop association properties).
+traceloop-sdk>=0.30
+opentelemetry-sdk>=1.27
+
+# Dev / offline tests
+pytest>=8.0

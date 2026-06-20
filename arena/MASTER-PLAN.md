@@ -242,3 +242,38 @@ check once the expected output format is known.
 **To build (the bulk of remaining work — the arena interface is entirely unbuilt):**
 - `arena/orchestrator.py` (state machine + classifier + ledger), `arena/mcp_client.py` (resilient `mcp_call`), `arena/run_log.jsonl` (memory/feedback/crash-recovery).
 - Rewrite `agent/requirements.txt` (`anthropic>=0.69`; +fastmcp/httpx/traceloop-sdk/opentelemetry-sdk; −fastapi/uvicorn) and `agent/agent.py` `SYSTEM_PROMPT` + loop per Phases 0–1.
+
+## 12. LIVE FINDINGS — confirmed against the real arena (2026-06-20)
+
+The setup baseline (Anthropic SDK + FastMCP, **no helper tools, no eval gate**) was run live by
+Raghav. The full pipeline works end-to-end: **register → get_tasks → Claude solves → submit_task**.
+It solved 9 tasks and climbed **Level 1 → Level 6** (5 level-ups) in one process.
+
+**Confirmed response shapes (these resolve §9/§10 unknowns):**
+- `register_agent` → **JSON**: `{"status":"REGISTERED","agentId":"<id>","level":1,"message":"..."}`
+  (NOT the `AGENT_ID:` text the docs implied — the reference bot's regex would fail here). Parsers
+  are now JSON-first (`arena/mcp_client.py`).
+- `get_tasks` → **JSON task**: `{id, title, description, level, points, ...}`. `id` is sometimes a
+  slug (`grounded-search-framework-lifecycle`), sometimes a random token (`3i22FyUH0RZ7NYnIpOMb`).
+- End-of-tasks → **plain text**: `ALL_TASKS_ATTEMPTED: You have solved all active tasks for Level N.
+  Please wait for level advancement or new tasks.` (our `parse_task` returns None → clean stop).
+- `submit_task` → score parses fine; **≥70 = LEVEL_UP confirmed** (70 leveled up, 60 did not).
+
+**⚠️ `register_agent` is NOT idempotent.** Each call returns a NEW agentId (`aTx5...` then `DJ7...`),
+despite the same name — so each run is a fresh agent **starting at Level 1**. Progress does NOT
+persist across runs. ⇒ **The real competitive run must be ONE strong single process**; re-running
+throws away progress. (Contradicts the tutorial's "won't create a duplicate.")
+
+**Score breakdown — the low scores are exactly the tool-needing tasks (validates the thesis):**
+- Grounded Search (data_extraction) → **15** · needs `web_search` grounding.
+- BigCodeBench/10 (code_synthesis) → **30** · needs `code_execution` to run/verify.
+- Basic Log Extraction (data_extraction) → **60** · needs programmatic parsing.
+- Ticker (general) → **15**.
+- The rest (Python/0, Financial Math, BigCodeBench/540, Saga, Swarm Consensus) → **70–80**, leveled up.
+
+**Build-phase priorities (now data-driven):**
+1. `code_execution` — write+run+verify code (fix the 30s).
+2. `web_search` / grounding — fix grounded-search/data tasks (the 15s).
+3. The eval/verify PASS-gate — lift 60→70+ and dodge the lucky-guess penalty.
+4. **Keep-alive on `ALL_TASKS_ATTEMPTED`** — wait/poll for level advancement instead of exiting.
+5. Run as a single long process (register once; don't restart — see non-idempotency above).

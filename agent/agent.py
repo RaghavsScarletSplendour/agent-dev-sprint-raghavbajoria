@@ -1,23 +1,22 @@
 """
-Agent Dev-Sprint — battle-ready agent core.
+Agent Arena — inner solver (Claude ReAct core).
 
-A minimal, dependency-light ReAct agent: Perception -> Reasoning -> Tool-Calling,
-on a manual agentic loop so we control every iteration (logging, loop guards,
-human-in-the-loop). Built to be ADAPTED once the starter kit lands — swap the
-tools, swap the system prompt, point `act()` at the arena endpoint.
+A minimal, dependency-light ReAct agent (Perception -> Reasoning -> Tool-Calling) on a
+manual agentic loop so we control every iteration (logging, loop guards). The arena
+orchestrator (arena/orchestrator.py) drives this per task: it passes a task prompt to
+`Agent.run()` and gets back the final answer to submit.
 
-The three things that win the arena and that most teams get wrong are all here:
-  1. A hard step cap                  -> never loops forever.
-  2. Repeat-action detection          -> kills "agent stuck calling the same tool".
-  3. Tight context + cheap decisions  -> fast, cheap turns in a real-time arena.
+The loop guards that keep us safe in a long run:
+  1. MAX_STEPS            -> a hard ceiling; never loops forever.
+  2. MAX_REPEAT_ACTIONS   -> kills "agent stuck calling the same tool".
+Errors from tools come back as tool_results (text), never crashes.
 
-Run:  ANTHROPIC_API_KEY=sk-... python agent.py
+Run the full arena loop with:  python -m arena.orchestrator
 """
 
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -72,46 +71,28 @@ tools = Registry()
 
 
 # --------------------------------------------------------------------------- #
-# Example tools — DELETE THESE and register the arena's real tools/APIs.
+# No tools are registered in the SETUP baseline: the model answers each task
+# directly in one turn (tools.specs() -> []). The point-getter tools
+# (code_execution, web_search/web_fetch, a safe-AST calc, ...) are wired in the
+# BUILD phase — see arena/MASTER-PLAN.md §5.
 # --------------------------------------------------------------------------- #
-@tools.add(
-    "calc",
-    "Evaluate a basic arithmetic expression and return the numeric result.",
-    {
-        "type": "object",
-        "properties": {"expression": {"type": "string", "description": "e.g. '2 * (3 + 4)'"}},
-        "required": ["expression"],
-        "additionalProperties": False,
-    },
-)
-def _calc(expression: str) -> float:
-    # Arena tools will hit real APIs; this is just a placeholder.
-    import ast
-    import operator as op
-    ops = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul,
-           ast.Div: op.truediv, ast.Pow: op.pow, ast.USub: op.neg}
-
-    def ev(node: ast.AST) -> float:
-        if isinstance(node, ast.Constant):
-            return float(node.value)
-        if isinstance(node, ast.BinOp):
-            return ops[type(node.op)](ev(node.left), ev(node.right))
-        if isinstance(node, ast.UnaryOp):
-            return ops[type(node.op)](ev(node.operand))
-        raise ValueError("unsupported expression")
-
-    return ev(ast.parse(expression, mode="eval").body)
 
 
 # --------------------------------------------------------------------------- #
 # The agent loop.
 # --------------------------------------------------------------------------- #
 SYSTEM_PROMPT = (
-    "You are an autonomous agent competing in a live, real-time arena. "
-    "Perceive the current state, reason briefly with a clear plan, then act via tools. "
-    "Prefer decisive single moves over long deliberation — turns are time- and token-budgeted. "
-    "Never repeat a tool call that already failed or that returned the same result; "
-    "change your approach instead. When the task is done, state the final answer plainly."
+    "You are an expert problem-solver competing in the Agent Arena, where an AI evaluator "
+    "scores each answer 0-100 on correctness, completeness, and rigor.\n\n"
+    "For the task you are given:\n"
+    "1. ANALYZE — restate the problem, surface every explicit and implicit requirement, "
+    "and note edge cases.\n"
+    "2. SOLVE — produce a complete, correct, self-contained solution. Make reasonable "
+    "assumptions and state them; never ask for clarification.\n"
+    "3. REVIEW — before finalizing, verify correctness, completeness, and edge cases.\n\n"
+    "Then output ONLY the final answer/solution — no analysis narration, no preamble, no "
+    "'Here is...'. The text you return IS what gets graded, so it must stand on its own. "
+    "Be thorough but do not pad."
 )
 
 
@@ -119,6 +100,7 @@ SYSTEM_PROMPT = (
 class Agent:
     client: anthropic.Anthropic = field(default_factory=anthropic.Anthropic)
     system: str = SYSTEM_PROMPT
+    last_usage: Any = None  # resp.usage from the most recent call (for the build-phase ledger)
 
     def run(self, task: str) -> str:
         messages: list[dict[str, Any]] = [{"role": "user", "content": task}]
@@ -135,9 +117,13 @@ class Agent:
                 tools=tools.specs(),
                 messages=messages,
             )
+            self.last_usage = getattr(resp, "usage", None)
 
             if resp.stop_reason == "refusal":
                 return "[agent refused]"
+            # TODO(build): handle stop_reason == "pause_turn" (re-send to resume) once
+            # server-side tools (code_execution / web_search) are added. With no tools
+            # registered in the setup baseline, pause_turn cannot occur.
 
             messages.append({"role": "assistant", "content": resp.content})
 
@@ -169,7 +155,5 @@ class Agent:
 
 
 if __name__ == "__main__":
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        raise SystemExit("Set ANTHROPIC_API_KEY first (e.g. `export ANTHROPIC_API_KEY=sk-...`).")
-    agent = Agent()
-    print(agent.run("What is (17 * 23) + 5, and is that prime? Use the calc tool."))
+    # This module is the inner solver, driven per-task by arena/orchestrator.py.
+    print("agent.py is a library. Run the arena loop with: python -m arena.orchestrator")

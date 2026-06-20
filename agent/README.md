@@ -1,33 +1,62 @@
-# Agent core — quick start
+# Arena Agent — how to run
 
-A framework-agnostic ReAct agent skeleton, ready to adapt to whatever the
-starter kit hands us on-site.
+An MCP **client** that registers with the Agent Arena, pulls tasks, solves them with
+`claude-opus-4-8`, and submits/skips. **Claude Code built this; you run it** (the agent talks
+to `agent-arena.dev` on its own — Claude Code never connects to the arena).
+
+> This is the SETUP baseline: a correct, bounded `register → get_task → solve → submit/skip`
+> loop with the proven guardrails. The point-getter tools, eval/critic gate, ledger, and
+> efficiency tuning are the next ("build") phase — see `arena/MASTER-PLAN.md`.
+
+## One-time setup
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-...
-python agent.py            # runs the built-in smoke test
+pip install -r agent/requirements.txt
 ```
 
-## What's in here
+## Before every run — checklist (this is the load-bearing part)
 
-`agent.py` is one file with three pieces:
+1. **JWT is FRESH.** `ARENA_ID_TOKEN` in `.env` expires ~1 hour after sign-in. Re-paste a fresh
+   one from the arena web app (DevTools → Application → Storage) right before running.
+2. **`GITHUB_URL` + `LINKEDIN_URL` filled** in `.env` — `register_agent` requires both.
+3. **`ANTHROPIC_API_KEY` set** in `.env`.
+4. **`TRACELOOP_API_KEY` set** in `.env` (recommended — the arena uses tracing to credit tool use).
+5. `.env` exists (copy from `.env.example` on a fresh clone). It is gitignored — never committed.
 
-- **`Registry`** — register a tool with `@tools.add(name, description, schema)`. Tools are sorted by name so the prompt prefix stays byte-stable (prompt-cache friendly).
-- **`Agent.run(task)`** — the manual ReAct loop: call the model → if it asks for tools, run them and feed results back → repeat until it answers or a guard trips.
-- **Loop guards** — `MAX_STEPS` (hard ceiling) and `MAX_REPEAT_ACTIONS` (kills repeated identical calls). These are why our agent won't hang in the arena.
+The agent fails loudly at startup naming any missing/placeholder var, so a half-filled `.env`
+won't silently misbehave.
 
-## Adapting it for the Arena (Lap 3 / Showdown)
+## Run
 
-1. **Replace the `calc` tool** with the arena's real tools/APIs — one `@tools.add` per action the agent can take.
-2. **Edit `SYSTEM_PROMPT`** to encode the arena's rules, scoring, and win condition.
-3. **Wire `Agent.run` to the arena loop** — if the arena pushes state each tick, feed it in as the next user message instead of a static task string.
-4. **Tune `effort`** in `agent.py`: `low` for speed-critical ticks, `medium` (default) for balance, `high` when a move really matters.
-5. If we must expose an HTTP endpoint, wrap `Agent.run` in a tiny FastAPI/Flask handler — the loop itself doesn't change.
+```bash
+# from the repo root, venv active:
+python -m arena.orchestrator
+```
 
-## Why these choices
+You'll see logs for: register (AGENT_ID + level), each task fetched (with its detected category),
+and either a submit score / `LEVEL_UP` or a skip. The loop stops at `MAX_TASKS` (default 10) or
+after `MAX_CONSEC_SKIPS` (default 3) consecutive skips — it can't run away.
 
-- **Manual loop, not the SDK tool-runner** — we need to see and gate every step (logging, loop guards, real-time state injection). The arena rewards control.
-- **`claude-opus-4-8` + adaptive thinking** — latest, most capable model; the model decides how hard to think per turn, `effort` caps the spend.
-- **Errors become tool results, not crashes** — a failed tool returns text the model can recover from, so one bad call doesn't kill the run.
+## Troubleshooting
+
+- **`SystemExit: [auth] ...` or a 401** — your JWT expired. Paste a fresh `ARENA_ID_TOKEN` in
+  `.env` and re-run.
+- **`Missing/placeholder required .env vars: ...`** — fill those in `.env`.
+- **Endpoint trouble** — the client auto-falls back from `agent-arena.dev/mcp` to the Cloud Run
+  URL; both live in `arena/config.py`.
+
+## Layout
+
+- `agent/agent.py` — the inner Claude solver (manual ReAct loop + loop guards).
+- `agent/prompts.py` — the task prompt builder (ANALYZE → SOLVE → REVIEW, final-answer-only).
+- `arena/config.py` — loads + validates `.env`.
+- `arena/mcp_client.py` — the resilient MCP transport + response parsers.
+- `arena/orchestrator.py` — the loop that owns the 4 arena tools (`python -m arena.orchestrator`).
+- `agent/test_agent.py` — offline tests (no network): `python agent/test_agent.py`.
+
+## Tests (offline — no network, no arena)
+
+```bash
+python agent/test_agent.py        # or: python -m pytest agent/test_agent.py -q
+```

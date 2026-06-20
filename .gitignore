@@ -18,3 +18,7 @@ venv/
 
 # Claude Code session / workflow artifacts
 .claude/
+
+# Third-party reference repo (borrowed patterns only — not ours to commit)
+agent-arena-bot-main/
+*.zip
