@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.egg-info/
+
+# Secrets — never commit the model key
+.env.*
+*.key
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
