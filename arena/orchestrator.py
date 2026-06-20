@@ -22,7 +22,15 @@ from dataclasses import dataclass, field
 import anthropic
 
 from agent.agent import Agent
-from agent.prompts import build_task_prompt, detect_task_type, toolset_for_category
+from agent.prompts import (
+    VERIFY_SYSTEM,
+    build_revision_prompt,
+    build_task_prompt,
+    build_verify_prompt,
+    detect_task_type,
+    parse_verdict,
+    toolset_for_category,
+)
 from arena.config import Config, assert_valid, load_config
 from arena.mcp_client import (
     ArenaAuthError,
@@ -44,6 +52,12 @@ MAX_CONSEC_SKIPS = 3    # stop if we skip this many in a row (anti-starvation)
 # BOUNDED number of times so the single live process keeps climbing as levels open.
 MAX_KEEPALIVE_RETRIES = 6
 KEEPALIVE_SLEEP_S = 15
+
+# Verify gate (BUILD phase): an independent reviewer checks the draft (running code where
+# possible) before the one-shot submit; on FAIL we revise up to N times, then submit
+# best-effort (live runs showed wrong submits only score low — no ban — so a 40 beats a 0).
+VERIFY_ENABLED = True
+VERIFY_MAX_REVISIONS = 1
 
 
 @dataclass
@@ -171,16 +185,39 @@ def effort_for(task: dict, category: str) -> str:
     return "high"
 
 
-async def solve(task: dict, agent: Agent) -> tuple[str, object | None]:
-    # Route per category: pick the server-tool set and effort, then hand them to the
-    # agent. code/logic/data -> code_execution ALONE; context/grounded -> web tools ALONE
-    # (never mixed — enforced by toolset_for_category's one-set-per-category map).
+def route(task: dict) -> tuple[str, list[dict], str]:
+    """Single source of routing: category -> (server-tool set, effort). code/logic/data ->
+    code_execution ALONE; context/grounded -> web tools ALONE; general -> none."""
     category = detect_task_type(str(task.get("title", "")), str(task.get("description", "")))
-    server_tools = toolset_for_category(category)
-    effort = effort_for(task, category)
+    return category, toolset_for_category(category), effort_for(task, category)
+
+
+async def solve(task: dict, agent: Agent, server_tools: list[dict], effort: str) -> str:
     # Inner Claude loop is synchronous; fine for this sequential orchestrator.
-    answer = agent.run(build_task_prompt(task), effort=effort, server_tools=server_tools)
-    return answer, agent.last_usage
+    return agent.run(build_task_prompt(task), effort=effort, server_tools=server_tools)
+
+
+async def review(task: dict, draft: str, critic: Agent,
+                 server_tools: list[dict], effort: str) -> dict:
+    """Independent reviewer: run/check the draft, return a verdict dict. Never raises."""
+    try:
+        verdict_text = critic.run(build_verify_prompt(task, draft),
+                                  effort=effort, server_tools=server_tools)
+    except Exception as exc:  # noqa: BLE001 — a critic failure must not block submit
+        print(f"[verify] critic error: {exc} — defaulting to PASS")
+        return {"pass": True, "score_estimate": None, "reason": str(exc), "fix_hint": ""}
+    return parse_verdict(verdict_text)
+
+
+async def revise(task: dict, draft: str, fix_hint: str, agent: Agent,
+                 server_tools: list[dict], effort: str) -> str:
+    """Re-solve once with the reviewer's fix. Empty string on error (-> keep the draft)."""
+    try:
+        return agent.run(build_revision_prompt(task, draft, fix_hint),
+                         effort=effort, server_tools=server_tools)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[verify] revision error: {exc} — keeping the original draft")
+        return ""
 
 
 async def submit(cfg: Config, state: RunState, task: dict, content: str) -> None:
@@ -232,11 +269,10 @@ async def skip(cfg: Config, state: RunState, task: dict, reason: str = "setup-ba
 # --------------------------------------------------------------------------- #
 # Helpers + entrypoint
 # --------------------------------------------------------------------------- #
-async def _solve_safe(task: dict, agent: Agent) -> str:
+async def _solve_safe(task: dict, agent: Agent, server_tools: list[dict], effort: str) -> str:
     """Run the solver; a solver/Anthropic error becomes an empty answer (-> skip)."""
     try:
-        content, _usage = await solve(task, agent)
-        return content
+        return await solve(task, agent, server_tools, effort)
     except Exception as exc:  # noqa: BLE001 — one bad task must not kill the run
         print(f"[solve] error: {exc}")
         return ""
@@ -256,6 +292,9 @@ async def run(cfg: Config | None = None, agent: Agent | None = None) -> None:
     assert_valid(cfg)
     init_tracing(cfg)
     agent = agent or Agent(client=anthropic.Anthropic(api_key=cfg.anthropic_api_key))
+    # Independent reviewer for the verify gate: shares the client, distinct system prompt,
+    # fresh message list per call (so it re-examines rather than rubber-stamps).
+    critic = Agent(client=agent.client, system=VERIFY_SYSTEM)
     state = RunState()
 
     try:
@@ -269,12 +308,32 @@ async def run(cfg: Config | None = None, agent: Agent | None = None) -> None:
             if str(task["id"]) in state.submitted_task_ids:
                 await skip(cfg, state, task, reason="already submitted (sticky)")
                 continue
-            content = _usable_answer(await _solve_safe(task, agent))
-            # SETUP decision policy (BUILD phase replaces this with the eval/critic PASS-gate).
-            if content is None:
+            category, server_tools, effort = route(task)
+            final = _usable_answer(await _solve_safe(task, agent, server_tools, effort))
+            if final is None:
                 await skip(cfg, state, task, reason="no usable answer from solver")
             else:
-                await submit(cfg, state, task, content)
+                # Verify gate: an independent reviewer runs/checks the draft before the
+                # one-shot submit; on FAIL, revise up to VERIFY_MAX_REVISIONS, then submit.
+                revisions = 0
+                while VERIFY_ENABLED:
+                    verdict = await review(task, final, critic, server_tools, effort)
+                    if verdict["pass"]:
+                        print(f"[verify] PASS (est={verdict['score_estimate']})")
+                        break
+                    if revisions >= VERIFY_MAX_REVISIONS:
+                        print(f"[verify] FAIL after {revisions} revision(s) "
+                              f"(est={verdict['score_estimate']}) — submitting best-effort")
+                        break
+                    print(f"[verify] FAIL (est={verdict['score_estimate']}): "
+                          f"{verdict['reason'][:100]} — revising")
+                    revised = _usable_answer(
+                        await revise(task, final, verdict["fix_hint"], agent,
+                                     server_tools, effort))
+                    if revised is not None:
+                        final = revised
+                    revisions += 1
+                await submit(cfg, state, task, final)
             state.tasks_done += 1
     except ArenaAuthError as exc:
         raise SystemExit(f"[auth] {exc}\nPaste a fresh ARENA_ID_TOKEN in .env and re-run.")

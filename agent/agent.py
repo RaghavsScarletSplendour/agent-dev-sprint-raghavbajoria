@@ -152,7 +152,15 @@ class Agent:
 
             # ALWAYS append the assistant turn before deciding anything — the appended
             # turn carries any server_tool_use / *_tool_result blocks back on resume.
-            messages.append({"role": "assistant", "content": resp.content})
+            # Strip TRAILING thinking blocks: the API rejects an assistant message whose
+            # final block is `thinking` (seen live: "final block ... cannot be `thinking`").
+            # Thinking blocks BEFORE a tool_use are kept (required for tool continuation).
+            assistant_content = list(resp.content)
+            while assistant_content and getattr(assistant_content[-1], "type", None) in (
+                    "thinking", "redacted_thinking"):
+                assistant_content.pop()
+            messages.append({"role": "assistant",
+                             "content": assistant_content or resp.content})
 
             # Server-side tool loop hit its per-turn cap: re-send messages as-is (no new
             # user message) so the server resumes. MAX_STEPS still bounds the resumes.

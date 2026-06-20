@@ -486,6 +486,74 @@ def test_auth_error_clean_exit():
     print("PASS: auth error -> clean SystemExit (no infinite retry)")
 
 
+# --- 2c. Thinking-strip + verify gate (newest BUILD branches) ---------------
+@dataclass
+class ThinkingBlock:
+    thinking: str = "..."
+    type: str = "thinking"
+
+
+def test_strips_trailing_thinking_before_resend():
+    """An assistant turn ending in a thinking block must be stripped before re-send
+    (the live 400: 'final block ... cannot be `thinking`')."""
+    client = CapturingClient([
+        Resp([TextBlock("partial"), ThinkingBlock()], stop_reason="pause_turn"),
+        Resp([TextBlock("FINAL")], stop_reason="end_turn"),
+    ])
+    out = A.Agent(client=client).run("x")
+    assert out == "FINAL", out
+    resent = client.messages.calls[1]["messages"]          # the 2nd create() re-sent msgs
+    last_block = resent[-1]["content"][-1]                  # last block of the assistant turn
+    assert getattr(last_block, "type", None) != "thinking", last_block
+    print("PASS: trailing thinking stripped before re-send (no 400)")
+
+
+def test_parse_verdict():
+    from agent.prompts import parse_verdict
+    v = parse_verdict('{"pass": false, "score_estimate": 50, "reason": "r", "fix_hint": "f"}')
+    assert v["pass"] is False and v["score_estimate"] == 50 and v["fix_hint"] == "f"
+    v2 = parse_verdict('verdict: {"pass": true, "score_estimate": 88} done')
+    assert v2["pass"] is True and v2["score_estimate"] == 88
+    assert parse_verdict("not json")["pass"] is True  # default non-blocking
+    print("PASS: parse_verdict (json / embedded / default-pass on garbage)")
+
+
+def _fake_agent_seq(texts: list[str]) -> "A.Agent":
+    return A.Agent(client=FakeClient(
+        [Resp([TextBlock(t)], stop_reason="end_turn") for t in texts]))
+
+
+def test_verify_pass_submits():
+    arena = FakeArena(get_responses=['{"id":"t1","title":"x","description":"y"}'])
+    agent = _fake_agent_seq(["GOOD DRAFT", '{"pass": true, "score_estimate": 90}'])
+    _with_mocked_arena(arena, lambda: O.run(cfg=_fake_cfg(), agent=agent))
+    assert arena.count("submit_task") == 1
+    assert arena.args_for("submit_task")["content"] == "GOOD DRAFT"
+    print("PASS: verify PASS -> submits the draft, no revision")
+
+
+def test_verify_fail_triggers_revision():
+    arena = FakeArena(get_responses=['{"id":"t1","title":"x","description":"y"}'])
+    agent = _fake_agent_seq([
+        "DRAFT v1",
+        '{"pass": false, "score_estimate": 45, "fix_hint": "handle empty input", "reason": "incomplete"}',
+        "DRAFT v2 fixed",
+    ])
+    _with_mocked_arena(arena, lambda: O.run(cfg=_fake_cfg(), agent=agent))
+    assert arena.count("submit_task") == 1
+    assert arena.args_for("submit_task")["content"] == "DRAFT v2 fixed"
+    print("PASS: verify FAIL -> revises, submits the corrected answer")
+
+
+def test_verify_unparseable_defaults_pass():
+    arena = FakeArena(get_responses=['{"id":"t1","title":"x","description":"y"}'])
+    agent = _fake_agent_seq(["DRAFT", "sorry, no json here"])
+    _with_mocked_arena(arena, lambda: O.run(cfg=_fake_cfg(), agent=agent))
+    assert arena.count("submit_task") == 1
+    assert arena.args_for("submit_task")["content"] == "DRAFT"
+    print("PASS: unparseable verdict -> default pass, submits draft (non-blocking)")
+
+
 if __name__ == "__main__":
     test_converges_to_final_answer()
     test_max_steps_cap()
@@ -510,4 +578,9 @@ if __name__ == "__main__":
     test_no_keepalive_on_genuine_none()
     test_max_tasks_bound()
     test_auth_error_clean_exit()
+    test_strips_trailing_thinking_before_resend()
+    test_parse_verdict()
+    test_verify_pass_submits()
+    test_verify_fail_triggers_revision()
+    test_verify_unparseable_defaults_pass()
     print("\nAll offline tests passed — agent guards + arena flow are verified.")

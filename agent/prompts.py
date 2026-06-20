@@ -11,6 +11,9 @@ Kept here (out of the orchestrator) so the logic is unit-testable:
 
 from __future__ import annotations
 
+import json
+import re
+
 # Arena task categories (arena/MCP-DOCS.md §04) + a general fallback.
 # Order matters: the first pattern that matches wins.
 TASK_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
@@ -101,3 +104,66 @@ def build_task_prompt(task: dict) -> str:
         "preamble, no 'Here is'. Your response is graded verbatim, so make it complete "
         "and self-contained."
     )
+
+
+# --------------------------------------------------------------------------- #
+# Verify gate (BUILD phase) — an INDEPENDENT reviewer that prefers to verify by
+# RUNNING/checking (not just reading) before the one-shot submit.
+# --------------------------------------------------------------------------- #
+VERIFY_SYSTEM = (
+    "You are a STRICT, INDEPENDENT reviewer in the Agent Arena. You did NOT write the "
+    "candidate answer — do not assume it is correct. Given a TASK and a CANDIDATE ANSWER, "
+    "decide whether it is correct, complete, and in a form that scores >= 70/100.\n"
+    "VERIFY BY DOING, not by reading: if it is code/computation and you have a code "
+    "execution tool, RUN it on the requirements + edge cases; if it has factual claims and "
+    "you have web tools, check them. Judge by reading ONLY when you cannot run anything.\n"
+    "Respond with ONLY a JSON object and nothing else:\n"
+    '{"pass": true|false, "score_estimate": <int 0-100>, "reason": "<one line>", '
+    '"fix_hint": "<one concrete fix if not passing, else empty>"}'
+)
+
+
+def build_verify_prompt(task: dict, draft: str) -> str:
+    """Reviewer's user message: the task + the candidate answer to check."""
+    return (
+        f"TASK (Level {task.get('level', '?')}, {task.get('points', '?')} points)\n"
+        f"Title: {task.get('title', '')}\n\n"
+        f"Description:\n{task.get('description', '')}\n\n"
+        f"CANDIDATE ANSWER (review this — you did NOT write it):\n{draft}\n\n"
+        "Verify it (run/check wherever you can). Output ONLY the JSON verdict."
+    )
+
+
+def build_revision_prompt(task: dict, draft: str, fix_hint: str) -> str:
+    """Re-solve prompt carrying the reviewer's concrete fix."""
+    return (
+        f"{build_task_prompt(task)}\n\n"
+        f"YOUR PREVIOUS ATTEMPT:\n{draft}\n\n"
+        f"An independent reviewer found a problem — FIX IT:\n{fix_hint}\n\n"
+        "Output ONLY the corrected final answer."
+    )
+
+
+def parse_verdict(text: str) -> dict:
+    """Parse the reviewer's JSON verdict (bare or embedded in prose). Defaults to PASS on
+    anything unparseable so a critic glitch never BLOCKS a submit (the gate only helps)."""
+    default = {"pass": True, "score_estimate": None, "reason": "", "fix_hint": ""}
+    data = None
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        m = re.search(r"\{.*\}", text or "", re.DOTALL)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+            except json.JSONDecodeError:
+                data = None
+    if not isinstance(data, dict):
+        return default
+    est = data.get("score_estimate")
+    return {
+        "pass": bool(data.get("pass", True)),
+        "score_estimate": int(est) if isinstance(est, (int, float)) else None,
+        "reason": str(data.get("reason", "")),
+        "fix_hint": str(data.get("fix_hint", "")),
+    }
