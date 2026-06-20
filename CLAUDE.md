@@ -6,6 +6,8 @@ This is my working folder for **Agent Dev-Sprint: Build, Deploy, and Battle** �
 
 I'll be **dropping notes as the day goes** — captured live, often rough. Treat them as the running source of truth for what's happening and what I need next.
 
+> 📌 **Full event details are in [`EVENT.md`](EVENT.md)** — the canonical, chat-reset-proof reference (logistics, entry rules, the "Laps" flow, arena format, the goal). Read it first if you're missing context. The summary below is just a quick glance.
+
 ## The event at a glance
 
 - **Date:** Saturday, June 20th, 2026 · 10:30 AM – 4:30 PM (arrive 10:00 AM, check-in is strict)
